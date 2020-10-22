@@ -1,3 +1,19 @@
+#include <mcp_can_dfs.h>
+#include <mcp_can.h>
+
+#include "src/libcanard/canard.h"
+#include "src/libcanard/canard_dsdl.h"
+
+#define NODE_ID 1
+
+// libcanard
+CanardInstance canard_instance;
+static const uint16_t HeartbeatSubjectID = 7509;
+volatile boolean do_publish_heartbeat = false;
+
+// Seeed-Studio/CAN_BUS_Shield
+const int SPI_CS_PIN = 53;
+MCP_CAN CAN(SPI_CS_PIN);
 
 // LED to indicate heartbeat
 const int led_pin = PB7;
@@ -5,20 +21,65 @@ const int led_pin = PB7;
 //Counter and compare values for 1Hz timer interrupt
 const uint16_t tl_comp = 15625;
 
+// Memory management for libcanard
+static void *canardAllocate(CanardInstance *const ins, const size_t amount)
+{
+    (void)ins;
+    return malloc(amount);
+}
+
+static void canardFree(CanardInstance *const ins, void *const pointer)
+{
+    (void)ins;
+    free(pointer);
+}
+
 void setup()
 {
+
     setupOneHertzTimer();
+
+    // Initialize the node with a static node-ID as specified in the command-line arguments.
+    canard_instance = canardInit(&canardAllocate, &canardFree);
+    canard_instance.mtu_bytes = CANARD_MTU_CAN_CLASSIC; // Do not use CAN FD to enhance compatibility.
+    canard_instance.node_id = (CanardNodeID)NODE_ID;
+
+    Serial.begin(115200);
+
+    // Initialize the CAN bus module
+    while (CAN_OK != CAN.begin(CAN_500KBPS))
+    {
+        Serial.println("CAN BUS Shield init fail");
+        Serial.println(" Init CAN BUS Shield again");
+        delay(100);
+    }
+    Serial.println("CAN BUS Shield init ok!");
+    Serial.flush();
 }
 
 // the loop function runs over and over again forever
 void loop()
 {
-    delay(1000);
+    if (do_publish_heartbeat) {
+        publishHeartbeat(0);
+        do_publish_heartbeat = false;
+    }
+    
+    // Transmit pending frames.
+    const CanardFrame *txf = canardTxPeek(&canard_instance);
+    while (txf != NULL)
+    {
+        canTransmit(txf);
+        canardTxPop(&canard_instance);
+        free((void *)txf);
+        txf = canardTxPeek(&canard_instance);
+    }
 }
 
 ISR(TIMER4_COMPA_vect)
 {
     PORTB ^= (1 << led_pin);
+    do_publish_heartbeat = true;
 }
 
 void setupOneHertzTimer()
@@ -46,4 +107,37 @@ void setupOneHertzTimer()
     // Enalble Timer4 and set compare value
     TIMSK4 = (1 << OCIE4A);
     sei();
+}
+
+static void publishHeartbeat(const uint32_t uptime)
+{
+    static CanardTransferID transfer_id;
+    const uint8_t payload[7] = {
+        (uint8_t)(uptime >> 0U),
+        (uint8_t)(uptime >> 8U),
+        (uint8_t)(uptime >> 16U),
+        (uint8_t)(uptime >> 24U),
+        0,
+        0,
+        0,
+    };
+    const CanardTransfer transfer = {
+        timestamp_usec : uptime,
+        priority : CanardPriorityNominal,
+        transfer_kind : CanardTransferKindMessage,
+        port_id : HeartbeatSubjectID,
+        remote_node_id : CANARD_NODE_ID_UNSET,
+        transfer_id : transfer_id,
+        payload_size : sizeof(payload),
+        payload : &payload[0]
+    };
+    ++transfer_id;
+    canardTxPush(&canard_instance, &transfer);
+    //maybe return result of canardTxPush?
+}
+
+int canTransmit(const CanardFrame *frame)
+{
+    byte cansSendStatus = CAN.sendMsgBuf(frame->extended_can_id, 1, frame->payload_size, frame->payload);
+    return cansSendStatus;
 }
